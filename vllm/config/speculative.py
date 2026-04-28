@@ -976,6 +976,7 @@ class SpeculativeConfig:
             "hunyuan_vl",
             "hunyuan_v1_dense",
             "afmoe",
+            "nemotron",
             "nemotron_h",
             "deepseek_v2",
             "deepseek_v3",
