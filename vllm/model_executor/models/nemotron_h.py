@@ -64,9 +64,11 @@ from vllm.model_executor.model_loader.weight_utils import (
     maybe_remap_kv_scale_name,
 )
 from vllm.model_executor.models.interfaces import (
+    EagleModelMixin,
     HasInnerState,
     IsHybrid,
     MixtureOfExperts,
+    SupportsEagle3,
     SupportsLoRA,
     SupportsMambaPrefixCaching,
     SupportsPP,
@@ -539,7 +541,7 @@ ALL_DECODER_LAYER_TYPES = {
 
 
 @support_torch_compile
-class NemotronHModel(nn.Module):
+class NemotronHModel(nn.Module, EagleModelMixin):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
 
@@ -559,6 +561,14 @@ class NemotronHModel(nn.Module):
         )
 
         self.has_moe = "E" in config.hybrid_override_pattern
+
+        # Indices of attention ("*") layers in the hybrid pattern. Used for
+        # Eagle3 aux-hidden-state extraction: Mamba-2 layers carry SSM state
+        # that the (Llama-shape) Eagle3 drafter cannot continue, so we only
+        # expose attention layers as candidate aux taps.
+        self.attention_layer_ids: tuple[int, ...] = tuple(
+            i for i, c in enumerate(config.hybrid_override_pattern) if c == "*"
+        )
 
         def get_layer(prefix: str):
             layer_idx = int(prefix.rsplit(".", 1)[1])
@@ -593,7 +603,7 @@ class NemotronHModel(nn.Module):
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
-    ) -> torch.Tensor | IntermediateTensors:
+    ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
@@ -605,18 +615,31 @@ class NemotronHModel(nn.Module):
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
 
-        for layer in islice(self.layers, self.start_layer, self.end_layer):
+        aux_hidden_states: list[torch.Tensor] = []
+        for layer_idx, layer in enumerate(
+            islice(self.layers, self.start_layer, self.end_layer),
+            start=self.start_layer,
+        ):
             hidden_states, residual = layer(
                 positions=positions,
                 hidden_states=hidden_states,
                 residual=residual,
             )
+            # Only emit at the requested layer indices; the parent's
+            # set_aux_hidden_state_layers / get_eagle3_default_aux_hidden_state_layers
+            # filters these to attention-only positions for Nemotron-H.
+            if (layer_idx + 1) in self.aux_hidden_state_layers:
+                aux_hidden_states.append(
+                    hidden_states + residual if residual is not None else hidden_states
+                )
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors(
                 {"hidden_states": hidden_states, "residual": residual}
             )
         hidden_states, _ = self.norm_f(hidden_states, residual)
+        if aux_hidden_states:
+            return hidden_states, aux_hidden_states
         return hidden_states
 
     def is_spec_layer(self, config: NemotronHConfig, weight_name: str) -> bool:
@@ -771,9 +794,32 @@ class NemotronHForCausalLM(
     SupportsQuant,
     MixtureOfExperts,
     SupportsMambaPrefixCaching,
+    SupportsEagle3,
 ):
     # Relevant only if self.has_moe is True
     is_non_gated_moe: bool = True
+
+    def get_eagle3_default_aux_hidden_state_layers(self) -> tuple[int, ...]:
+        """Default Eagle3 aux taps for Nemotron-H hybrid models.
+
+        Picks 3 attention ("*") layers spread early / mid / late from the
+        hybrid_override_pattern. Mamba-2 ("M") and MoE/MLP ("E") layers are
+        excluded because the (Llama-shape) Eagle3 drafter has no SSM state
+        continuation and was not trained to consume non-attention features.
+
+        For Nemotron-3-Nano-30B-A3B (pattern length 52, 6 attention layers
+        at indices (5, 12, 19, 26, 33, 42)) this returns (12, 26, 42).
+        """
+        attn_ids = self.model.attention_layer_ids
+        if len(attn_ids) == 0:
+            # Pure-Mamba backbone: no Eagle3-friendly taps available; fall
+            # back to the generic (early, mid, late) heuristic so callers at
+            # least get something rather than a hard failure.
+            num_layers = len(self.model.layers)
+            return (2, num_layers // 2, num_layers - 3)
+        if len(attn_ids) < 3:
+            return tuple(attn_ids)
+        return (attn_ids[1], attn_ids[len(attn_ids) // 2], attn_ids[-2])
 
     hf_to_vllm_mapper = WeightsMapper(
         orig_to_new_prefix={"backbone": "model"},
