@@ -807,6 +807,9 @@ class NemotronHForCausalLM(
         excluded because the (Llama-shape) Eagle3 drafter has no SSM state
         continuation and was not trained to consume non-attention features.
 
+        Concretely: skip the first attention layer (too close to embeddings),
+        take the middle attention layer, and take the last attention layer.
+
         For Nemotron-3-Nano-30B-A3B (pattern length 52, 6 attention layers
         at indices (5, 12, 19, 26, 33, 42)) this returns (12, 26, 42).
         """
@@ -817,9 +820,11 @@ class NemotronHForCausalLM(
             # least get something rather than a hard failure.
             num_layers = len(self.model.layers)
             return (2, num_layers // 2, num_layers - 3)
-        if len(attn_ids) < 3:
+        if len(attn_ids) <= 3:
+            # With <= 3 attention layers, return all of them (deduplicated).
+            # The "skip first" heuristic below would otherwise produce duplicates.
             return tuple(attn_ids)
-        return (attn_ids[1], attn_ids[len(attn_ids) // 2], attn_ids[-2])
+        return (attn_ids[1], attn_ids[len(attn_ids) // 2], attn_ids[-1])
 
     hf_to_vllm_mapper = WeightsMapper(
         orig_to_new_prefix={"backbone": "model"},
